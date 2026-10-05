@@ -1,7 +1,11 @@
 package com.familysafe.app
 
 import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -17,7 +21,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LocationOff
 import androidx.compose.material.icons.filled.LocationOn
@@ -34,6 +40,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.ListItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
@@ -41,14 +48,101 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import java.security.SecureRandom
+import org.json.JSONArray
+import org.json.JSONObject
 
-data class Member(val name: String, val status: String, val sharing: Boolean)
+data class Member(
+    val name: String,
+    val phone: String,
+    val code: String,
+    val status: String,
+    val sharing: Boolean = false
+)
+
+private const val PREFS = "familysafe"
+private const val KEY_MEMBERS = "members"
+
+private fun loadMembers(context: Context): List<Member> {
+    val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .getString(KEY_MEMBERS, null) ?: return emptyList()
+    return try {
+        val arr = JSONArray(raw)
+        (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Member(
+                name = o.getString("name"),
+                phone = o.getString("phone"),
+                code = o.getString("code"),
+                status = o.getString("status"),
+                sharing = o.optBoolean("sharing", false)
+            )
+        }
+    } catch (e: Exception) {
+        emptyList()
+    }
+}
+
+private fun saveMembers(context: Context, members: List<Member>) {
+    val arr = JSONArray()
+    members.forEach { m ->
+        arr.put(
+            JSONObject()
+                .put("name", m.name)
+                .put("phone", m.phone)
+                .put("code", m.code)
+                .put("status", m.status)
+                .put("sharing", m.sharing)
+        )
+    }
+    context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        .edit()
+        .putString(KEY_MEMBERS, arr.toString())
+        .apply()
+}
+
+private fun newInviteCode(): String {
+    val chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    val random = SecureRandom()
+    return (1..6).map { chars[random.nextInt(chars.length)] }.joinToString("")
+}
+
+private fun inviteMessage(name: String, code: String): String =
+    "Hi $name, I'm inviting you to join my family on FamilySafe, a private app where " +
+        "every person chooses whether to share their own location.\n\n" +
+        "Your invite code: $code\n\n" +
+        "Nothing is shared unless you open the app, accept, and turn sharing on yourself."
+
+private fun openWhatsApp(context: Context, phone: String, text: String) {
+    val digits = phone.filter { it.isDigit() }
+    val uri = Uri.parse("https://wa.me/$digits?text=${Uri.encode(text)}")
+    try {
+        context.startActivity(Intent(Intent.ACTION_VIEW, uri))
+    } catch (e: Exception) {
+        Toast.makeText(context, "Couldn't open WhatsApp", Toast.LENGTH_SHORT).show()
+    }
+}
+
+private fun shareText(context: Context, text: String) {
+    val send = Intent(Intent.ACTION_SEND).apply {
+        type = "text/plain"
+        putExtra(Intent.EXTRA_TEXT, text)
+    }
+    try {
+        context.startActivity(Intent.createChooser(send, "Send invitation"))
+    } catch (e: Exception) {
+        Toast.makeText(context, "No app available to share", Toast.LENGTH_SHORT).show()
+    }
+}
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -60,15 +154,17 @@ class MainActivity : ComponentActivity() {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FamilySafeApp() {
+    val context = LocalContext.current
+
     var sharing by remember { mutableStateOf(false) }
     var showPrivacy by remember { mutableStateOf(false) }
     var showInvite by remember { mutableStateOf(false) }
+    var inviteName by remember { mutableStateOf("") }
+    var invitePhone by remember { mutableStateOf("+91 ") }
 
-    // Rebuilt on every change of `sharing`, so the list always matches the switch.
-    val members = listOf(
-        Member("You", if (sharing) "Sharing your location" else "This phone", sharing),
-        Member("Family member", "Waiting for invitation", false)
-    )
+    val members = remember {
+        mutableStateListOf<Member>().also { it.addAll(loadMembers(context)) }
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -131,7 +227,11 @@ fun FamilySafeApp() {
 
             item {
                 Button(
-                    onClick = { showInvite = true },
+                    onClick = {
+                        inviteName = ""
+                        invitePhone = "+91 "
+                        showInvite = true
+                    },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Icon(Icons.Default.PersonAdd, contentDescription = null)
@@ -144,21 +244,46 @@ fun FamilySafeApp() {
                 Text("Family", style = MaterialTheme.typography.titleLarge)
             }
 
-            items(members) { member ->
+            item {
                 ListItem(
                     leadingContent = {
                         Icon(
-                            if (member.sharing) Icons.Default.LocationOn else Icons.Default.LocationOff,
+                            if (sharing) Icons.Default.LocationOn else Icons.Default.LocationOff,
                             contentDescription = null
                         )
+                    },
+                    headlineContent = { Text("You") },
+                    supportingContent = {
+                        Text(if (sharing) "Sharing your location" else "This phone")
+                    },
+                    trailingContent = { Text(if (sharing) "Sharing" else "Private") }
+                )
+                HorizontalDivider()
+            }
+
+            items(members) { member ->
+                ListItem(
+                    leadingContent = {
+                        Icon(Icons.Default.LocationOff, contentDescription = null)
                     },
                     headlineContent = { Text(member.name) },
                     supportingContent = { Text(member.status) },
                     trailingContent = {
-                        Text(if (member.sharing) "Sharing" else "Private")
+                        IconButton(onClick = {
+                            members.remove(member)
+                            saveMembers(context, members)
+                        }) {
+                            Icon(Icons.Default.Delete, contentDescription = "Remove")
+                        }
                     }
                 )
                 HorizontalDivider()
+            }
+
+            if (members.isEmpty()) {
+                item {
+                    Text("No family members yet. Tap \"Invite family member\" to add someone.")
+                }
             }
 
             item {
@@ -195,12 +320,65 @@ fun FamilySafeApp() {
     }
 
     if (showInvite) {
+        val canSend = inviteName.isNotBlank() && invitePhone.count { it.isDigit() } >= 8
+
+        fun createInvite(): String {
+            val code = newInviteCode()
+            members.add(
+                Member(
+                    name = inviteName.trim(),
+                    phone = invitePhone.trim(),
+                    code = code,
+                    status = "Invitation sent - code $code"
+                )
+            )
+            saveMembers(context, members)
+            return inviteMessage(inviteName.trim(), code)
+        }
+
         AlertDialog(
             onDismissRequest = { showInvite = false },
-            confirmButton = { TextButton(onClick = { showInvite = false }) { Text("Close") } },
             title = { Text("Invite family member") },
             text = {
-                Text("The production version will generate a one-time invitation code/link. The invited person must accept and grant location permission before their location is shared.")
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = inviteName,
+                        onValueChange = { inviteName = it },
+                        label = { Text("Name") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = invitePhone,
+                        onValueChange = { invitePhone = it },
+                        label = { Text("WhatsApp number with country code") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Phone),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    TextButton(
+                        enabled = inviteName.isNotBlank(),
+                        onClick = {
+                            val message = createInvite()
+                            showInvite = false
+                            shareText(context, message)
+                        }
+                    ) { Text("Send using another app / SMS") }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = canSend,
+                    onClick = {
+                        val phone = invitePhone
+                        val message = createInvite()
+                        showInvite = false
+                        openWhatsApp(context, phone, message)
+                    }
+                ) { Text("Send on WhatsApp") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showInvite = false }) { Text("Cancel") }
             }
         )
     }
