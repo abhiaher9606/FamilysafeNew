@@ -5,9 +5,11 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.location.Location
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.Looper
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -62,15 +64,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
-import com.google.android.gms.location.LocationCallback
-import com.google.android.gms.location.LocationRequest
-import com.google.android.gms.location.LocationResult
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.compose.LifecycleEventEffect
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.Priority
+import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.firebase.auth.FirebaseAuth
-import com.google.firebase.firestore.CollectionReference
 import com.google.firebase.firestore.FieldValue
-import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.ListenerRegistration
 import java.security.SecureRandom
 
@@ -85,26 +85,39 @@ data class FamilyMember(
 
 data class PendingInvite(val code: String, val inviteeName: String)
 
-private const val PREFS = "familysafe"
-private const val KEY_NAME = "my_name"
-private const val KEY_FAMILY = "family_id"
-private const val KEY_SHARING = "sharing"
-
-private val db: FirebaseFirestore
-    get() = FirebaseFirestore.getInstance()
-
-private fun membersRef(familyId: String): CollectionReference =
-    db.collection("families").document(familyId).collection("members")
+data class SosAlert(
+    val id: String,
+    val uid: String,
+    val name: String,
+    val lat: Double?,
+    val lng: Double?,
+    val createdMillis: Long?
+)
 
 // ---------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------
 
-private fun hasLocationPermission(context: Context): Boolean =
-    context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) ==
-        PackageManager.PERMISSION_GRANTED ||
-        context.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) ==
+private fun hasNotificationPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
         PackageManager.PERMISSION_GRANTED
+
+private fun hasBackgroundLocation(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+        context.checkSelfPermission(Manifest.permission.ACCESS_BACKGROUND_LOCATION) ==
+        PackageManager.PERMISSION_GRANTED
+
+private fun sharingPermissions(): Array<String> {
+    val list = mutableListOf(
+        Manifest.permission.ACCESS_FINE_LOCATION,
+        Manifest.permission.ACCESS_COARSE_LOCATION
+    )
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        list.add(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    return list.toTypedArray()
+}
 
 private fun toast(context: Context, message: String) {
     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
@@ -139,7 +152,7 @@ private fun shareText(context: Context, text: String) {
         putExtra(Intent.EXTRA_TEXT, text)
     }
     try {
-        context.startActivity(Intent.createChooser(send, "Send invitation"))
+        context.startActivity(Intent.createChooser(send, "Send"))
     } catch (e: Exception) {
         toast(context, "No app available to share")
     }
@@ -159,6 +172,23 @@ private fun openMap(context: Context, name: String, lat: Double, lng: Double) {
     }
 }
 
+private fun openBatterySettings(context: Context) {
+    try {
+        context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+    } catch (e: Exception) {
+        try {
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:${context.packageName}")
+                )
+            )
+        } catch (e2: Exception) {
+            toast(context, "Open Settings > Apps > FamilySafe > Battery")
+        }
+    }
+}
+
 private fun timeAgo(millis: Long?): String {
     if (millis == null) return "just now"
     val seconds = (System.currentTimeMillis() - millis) / 1000
@@ -170,8 +200,33 @@ private fun timeAgo(millis: Long?): String {
     }
 }
 
+/** Current location if possible, otherwise the last known one, otherwise null. */
+@SuppressLint("MissingPermission")
+private fun fetchBestLocation(context: Context, onResult: (Location?) -> Unit) {
+    if (!hasLocationPermission(context)) {
+        onResult(null)
+        return
+    }
+    val client = LocationServices.getFusedLocationProviderClient(context)
+    client.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
+        .addOnSuccessListener { loc ->
+            if (loc != null) {
+                onResult(loc)
+            } else {
+                client.lastLocation
+                    .addOnSuccessListener { last -> onResult(last) }
+                    .addOnFailureListener { onResult(null) }
+            }
+        }
+        .addOnFailureListener {
+            client.lastLocation
+                .addOnSuccessListener { last -> onResult(last) }
+                .addOnFailureListener { onResult(null) }
+        }
+}
+
 // ---------------------------------------------------------------
-// Firebase operations
+// Firebase operations (family + invitations)
 // ---------------------------------------------------------------
 
 private fun createFamily(
@@ -265,29 +320,6 @@ private fun joinWithCode(
         .addOnFailureListener { onResult(null, it.message ?: "Could not check the code") }
 }
 
-private fun setSharingFlag(familyId: String, uid: String, sharing: Boolean) {
-    val updates: Map<String, Any> = if (sharing) {
-        mapOf("sharing" to true)
-    } else {
-        mapOf(
-            "sharing" to false,
-            "lat" to FieldValue.delete(),
-            "lng" to FieldValue.delete()
-        )
-    }
-    membersRef(familyId).document(uid).update(updates)
-}
-
-private fun writeLocation(familyId: String, uid: String, lat: Double, lng: Double) {
-    membersRef(familyId).document(uid).update(
-        mapOf<String, Any>(
-            "lat" to lat,
-            "lng" to lng,
-            "updatedAt" to FieldValue.serverTimestamp()
-        )
-    )
-}
-
 // ---------------------------------------------------------------
 // Activity + UI
 // ---------------------------------------------------------------
@@ -299,7 +331,6 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@SuppressLint("MissingPermission")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun FamilySafeApp() {
@@ -324,12 +355,16 @@ fun FamilySafeApp() {
     var showInvite by remember { mutableStateOf(false) }
     var showJoin by remember { mutableStateOf(false) }
     var showLeave by remember { mutableStateOf(false) }
+    var showBgHelp by remember { mutableStateOf(false) }
+    var showSosConfirm by remember { mutableStateOf(false) }
+    var sosShareText by remember { mutableStateOf<String?>(null) }
     var inviteName by remember { mutableStateOf("") }
     var invitePhone by remember { mutableStateOf("+91 ") }
     var joinCode by remember { mutableStateOf("") }
 
     val members = remember { mutableStateListOf<FamilyMember>() }
     val pending = remember { mutableStateListOf<PendingInvite>() }
+    val sosAlerts = remember { mutableStateListOf<SosAlert>() }
 
     // ---- 1. Sign in (anonymous, no password needed) ----
     LaunchedEffect(Unit) {
@@ -401,40 +436,54 @@ fun FamilySafeApp() {
         onDispose { registration?.remove() }
     }
 
-    // ---- 4. Send my location while sharing is ON (app open) ----
-    DisposableEffect(sharing, familyId, uid) {
+    // ---- 4. Active SOS alerts in my family ----
+    DisposableEffect(familyId, uid) {
         val fid = familyId
         val me = uid
-        var client: com.google.android.gms.location.FusedLocationProviderClient? = null
-        var callback: LocationCallback? = null
-        if (sharing && fid != null && me != null && hasLocationPermission(context)) {
-            val c = LocationServices.getFusedLocationProviderClient(context)
-            val request = LocationRequest.Builder(
-                Priority.PRIORITY_BALANCED_POWER_ACCURACY,
-                30_000L
-            ).setMinUpdateIntervalMillis(15_000L).build()
-            val cb = object : LocationCallback() {
-                override fun onLocationResult(result: LocationResult) {
-                    val loc = result.lastLocation ?: return
-                    writeLocation(fid, me, loc.latitude, loc.longitude)
+        var registration: ListenerRegistration? = null
+        if (fid != null && me != null) {
+            registration = sosRef(fid)
+                .whereEqualTo("active", true)
+                .addSnapshotListener { snap, err ->
+                    if (err == null && snap != null) {
+                        sosAlerts.clear()
+                        snap.documents.forEach { d ->
+                            sosAlerts.add(
+                                SosAlert(
+                                    id = d.id,
+                                    uid = d.getString("uid") ?: "",
+                                    name = d.getString("name") ?: "Family member",
+                                    lat = d.getDouble("lat"),
+                                    lng = d.getDouble("lng"),
+                                    createdMillis = d.getTimestamp("createdAt")?.toDate()?.time
+                                )
+                            )
+                        }
+                    }
                 }
-            }
-            c.lastLocation.addOnSuccessListener { loc ->
-                if (loc != null) writeLocation(fid, me, loc.latitude, loc.longitude)
-            }
+        } else {
+            sosAlerts.clear()
+        }
+        onDispose { registration?.remove() }
+    }
+
+    // ---- 5. Make sure the background service is running while sharing is ON ----
+    LaunchedEffect(sharing, familyId, uid) {
+        if (sharing && familyId != null && uid != null && hasLocationPermission(context)) {
             try {
-                c.requestLocationUpdates(request, cb, Looper.getMainLooper())
-                client = c
-                callback = cb
-            } catch (e: SecurityException) {
-                // permission missing: nothing to do
+                LocationShareService.start(context)
+            } catch (e: Exception) {
+                // could not start right now; the switch can be toggled again
             }
         }
-        onDispose {
-            val c = client
-            val cb = callback
-            if (c != null && cb != null) c.removeLocationUpdates(cb)
-        }
+    }
+
+    // ---- 6. Re-read the sharing state when coming back to the app ----
+    // (the notification has a "Stop sharing" button that can change it)
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) {
+        sharing = p.getBoolean(KEY_SHARING, false) &&
+            p.getString(KEY_FAMILY, null) != null &&
+            hasLocationPermission(context)
     }
 
     // ---- actions ----
@@ -445,6 +494,15 @@ fun FamilySafeApp() {
         sharing = true
         p.edit().putBoolean(KEY_SHARING, true).apply()
         setSharingFlag(fid, me, true)
+        try {
+            LocationShareService.start(context)
+        } catch (e: Exception) {
+            toast(context, "Could not start background sharing")
+        }
+        if (!p.getBoolean(KEY_BG_HELP_SHOWN, false)) {
+            p.edit().putBoolean(KEY_BG_HELP_SHOWN, true).apply()
+            showBgHelp = true
+        }
     }
 
     fun stopSharing() {
@@ -452,6 +510,7 @@ fun FamilySafeApp() {
         val fid = familyId
         sharing = false
         p.edit().putBoolean(KEY_SHARING, false).apply()
+        LocationShareService.stop(context)
         if (me != null && fid != null) setSharingFlag(fid, me, false)
     }
 
@@ -462,8 +521,19 @@ fun FamilySafeApp() {
             result[Manifest.permission.ACCESS_COARSE_LOCATION] == true
         if (granted) {
             beginSharing()
+            if (!hasNotificationPermission(context)) {
+                toast(context, "Notifications are off, so you won't see the sharing notice or SOS alerts.")
+            }
         } else {
             toast(context, "Location permission is needed to share your location")
+        }
+    }
+
+    val backgroundLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        if (!granted) {
+            toast(context, "Not allowed all the time. Sharing may stop when the app is closed on some phones.")
         }
     }
 
@@ -523,6 +593,7 @@ fun FamilySafeApp() {
     fun leaveFamily() {
         val me = uid
         val fid = familyId
+        LocationShareService.stop(context)
         if (me != null && fid != null) {
             membersRef(fid).document(me).delete()
         }
@@ -532,9 +603,34 @@ fun FamilySafeApp() {
         members.clear()
     }
 
+    fun triggerSos() {
+        val me = uid ?: return
+        val fid = familyId ?: return
+        busy = true
+        fetchBestLocation(context) { loc ->
+            sendSos(fid, me, myName, loc?.latitude, loc?.longitude) { _, error ->
+                busy = false
+                if (error != null) {
+                    toast(context, error)
+                    return@sendSos
+                }
+                showSosConfirm = false
+                sosShareText = if (loc != null) {
+                    "SOS! I need help. My location: https://maps.google.com/?q=${loc.latitude},${loc.longitude}"
+                } else {
+                    "SOS! I need help."
+                }
+            }
+        }
+    }
+
     val sortedMembers = members.sortedWith(
         compareByDescending<FamilyMember> { it.uid == uid }.thenBy { it.name.lowercase() }
     )
+    val nowMs = System.currentTimeMillis()
+    val visibleSos = sosAlerts.filter {
+        it.createdMillis == null || nowMs - it.createdMillis < 2 * 60 * 60 * 1000L
+    }
 
     Scaffold(
         topBar = {
@@ -570,6 +666,40 @@ fun FamilySafeApp() {
                 }
             }
 
+            items(visibleSos, key = { "s_" + it.id }) { alert ->
+                val mine = alert.uid == uid
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer
+                    ),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(18.dp)) {
+                        Text(
+                            if (mine) "Your SOS is active" else "SOS from ${alert.name}",
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                        Text("Sent ${timeAgo(alert.createdMillis)}")
+                        Spacer(Modifier.height(10.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            if (alert.lat != null && alert.lng != null) {
+                                Button(
+                                    onClick = { openMap(context, alert.name, alert.lat, alert.lng) }
+                                ) { Text("Open map") }
+                            }
+                            if (mine) {
+                                OutlinedButton(
+                                    onClick = {
+                                        val fid = familyId
+                                        if (fid != null) resolveSos(fid, alert.id)
+                                    }
+                                ) { Text("I'm safe - cancel SOS") }
+                            }
+                        }
+                    }
+                }
+            }
+
             item {
                 Card(modifier = Modifier.fillMaxWidth()) {
                     Column(Modifier.padding(18.dp)) {
@@ -578,7 +708,7 @@ fun FamilySafeApp() {
                             style = MaterialTheme.typography.headlineSmall
                         )
                         Spacer(Modifier.height(6.dp))
-                        Text("Only people in your family group can see your location, and only while this switch is ON. Your location is shared while the app is open.")
+                        Text("Only people in your family group can see your location, and only while this switch is ON. While it is ON, sharing continues in the background and a notification stays visible.")
                         Spacer(Modifier.height(14.dp))
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Switch(
@@ -586,15 +716,10 @@ fun FamilySafeApp() {
                                 enabled = uid != null && familyId != null,
                                 onCheckedChange = { enabled ->
                                     if (enabled) {
-                                        if (hasLocationPermission(context)) {
+                                        if (hasLocationPermission(context) && hasNotificationPermission(context)) {
                                             beginSharing()
                                         } else {
-                                            permissionLauncher.launch(
-                                                arrayOf(
-                                                    Manifest.permission.ACCESS_FINE_LOCATION,
-                                                    Manifest.permission.ACCESS_COARSE_LOCATION
-                                                )
-                                            )
+                                            permissionLauncher.launch(sharingPermissions())
                                         }
                                     } else {
                                         stopSharing()
@@ -607,6 +732,10 @@ fun FamilySafeApp() {
                         if (familyId == null) {
                             Spacer(Modifier.height(8.dp))
                             Text("Invite someone or join with a code to start sharing.")
+                        } else {
+                            TextButton(onClick = { showBgHelp = true }) {
+                                Text("Background sharing tips")
+                            }
                         }
                     }
                 }
@@ -721,12 +850,19 @@ fun FamilySafeApp() {
                 ) {
                     Column(Modifier.padding(18.dp)) {
                         Text("Emergency", style = MaterialTheme.typography.titleMedium)
-                        Text("The SOS feature will notify your chosen family contacts after you enable it.")
+                        Text("SOS sends an alert and your current location to everyone in your family. Family members whose sharing is ON get a phone notification, even when the app is closed.")
                         Spacer(Modifier.height(10.dp))
-                        OutlinedButton(onClick = { }) {
+                        OutlinedButton(
+                            enabled = uid != null && familyId != null,
+                            onClick = { showSosConfirm = true }
+                        ) {
                             Icon(Icons.Default.Warning, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
                             Text("SOS")
+                        }
+                        if (familyId == null) {
+                            Spacer(Modifier.height(6.dp))
+                            Text("Join or create a family first.")
                         }
                     }
                 }
@@ -772,7 +908,75 @@ fun FamilySafeApp() {
             confirmButton = { TextButton(onClick = { showPrivacy = false }) { Text("OK") } },
             title = { Text("Privacy first") },
             text = {
-                Text("FamilySafe shares your location only with people in your family group, and only while your sharing switch is ON. Nobody can turn on another person's sharing. You can switch it off or leave the family at any time. Your location is stored in Firebase, protected by sign-in and access rules.")
+                Text("FamilySafe shares your location only with people in your family group, and only while your sharing switch is ON (a notification stays visible while it is). Nobody can turn on another person's sharing. You can switch it off or leave the family at any time. SOS is the only exception: it sends your location once, and only when you press it. Your data is stored in Firebase, protected by sign-in and access rules.")
+            }
+        )
+    }
+
+    if (showBgHelp) {
+        AlertDialog(
+            onDismissRequest = { showBgHelp = false },
+            title = { Text("Keep sharing when the app is closed") },
+            text = {
+                Text("1. Tap \"Allow all the time\" and choose \"Allow all the time\" for location.\n\n2. Open Battery settings and set FamilySafe to \"Unrestricted\" or \"No restrictions\". On Xiaomi/Redmi, Oppo, Vivo and Samsung phones also allow Autostart and keep the app out of \"sleeping apps\".\n\nWhile sharing is ON you will see a notification. Family members with sharing ON also get SOS alerts as notifications.")
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showBgHelp = false
+                    if (hasBackgroundLocation(context)) {
+                        toast(context, "Already allowed all the time")
+                    } else {
+                        backgroundLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                    }
+                }) { Text("Allow all the time") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showBgHelp = false
+                    openBatterySettings(context)
+                }) { Text("Battery settings") }
+            }
+        )
+    }
+
+    if (showSosConfirm) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) showSosConfirm = false },
+            title = { Text("Send SOS?") },
+            text = {
+                Text("Everyone in your family will get an emergency alert with your current location, even if your sharing switch is OFF.")
+            },
+            confirmButton = {
+                Button(
+                    enabled = !busy,
+                    onClick = { triggerSos() }
+                ) { Text(if (busy) "Sending..." else "Send SOS") }
+            },
+            dismissButton = {
+                TextButton(
+                    enabled = !busy,
+                    onClick = { showSosConfirm = false }
+                ) { Text("Cancel") }
+            }
+        )
+    }
+
+    val sosText = sosShareText
+    if (sosText != null) {
+        AlertDialog(
+            onDismissRequest = { sosShareText = null },
+            title = { Text("SOS sent") },
+            text = {
+                Text("Your family has been alerted in the app. Only members whose sharing is ON get a phone notification, so you can also send it by WhatsApp or SMS.")
+            },
+            confirmButton = {
+                Button(onClick = {
+                    shareText(context, sosText)
+                    sosShareText = null
+                }) { Text("Send by WhatsApp / SMS") }
+            },
+            dismissButton = {
+                TextButton(onClick = { sosShareText = null }) { Text("Done") }
             }
         )
     }
