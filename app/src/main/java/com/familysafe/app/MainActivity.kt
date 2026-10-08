@@ -12,6 +12,9 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -28,7 +31,9 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.LocationOff
 import androidx.compose.material.icons.filled.LocationOn
@@ -36,9 +41,11 @@ import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -62,6 +69,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
@@ -326,14 +335,40 @@ private fun joinWithCode(
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
-        setContent { FamilySafeApp() }
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        setContent {
+            val systemDark = isSystemInDarkTheme()
+            var dark by remember {
+                mutableStateOf(
+                    if (prefs.contains(KEY_DARK_MODE)) prefs.getBoolean(KEY_DARK_MODE, false)
+                    else systemDark
+                )
+            }
+            // Status bar and navigation bar icons follow the app's own mode.
+            LaunchedEffect(dark) {
+                val transparent = android.graphics.Color.TRANSPARENT
+                val style = if (dark) SystemBarStyle.dark(transparent)
+                else SystemBarStyle.light(transparent, transparent)
+                this@MainActivity.enableEdgeToEdge(statusBarStyle = style, navigationBarStyle = style)
+            }
+            FamilySafeTheme(dark = dark) {
+                FamilySafeApp(
+                    dark = dark,
+                    onToggleDark = {
+                        dark = !dark
+                        prefs.edit().putBoolean(KEY_DARK_MODE, dark).apply()
+                    }
+                )
+            }
+        }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun FamilySafeApp() {
+fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
     val context = LocalContext.current
     val p = remember { context.getSharedPreferences(PREFS, Context.MODE_PRIVATE) }
 
@@ -358,6 +393,10 @@ fun FamilySafeApp() {
     var showBgHelp by remember { mutableStateOf(false) }
     var showSosConfirm by remember { mutableStateOf(false) }
     var sosShareText by remember { mutableStateOf<String?>(null) }
+    var powerSos by remember { mutableStateOf(p.getBoolean(KEY_POWER_SOS, false)) }
+    var sosPresses by remember { mutableStateOf(p.getInt(KEY_SOS_PRESSES, 3).coerceIn(3, 4)) }
+    var showSosRules by remember { mutableStateOf(false) }
+    var rulesTurnOn by remember { mutableStateOf(false) }
     var inviteName by remember { mutableStateOf("") }
     var invitePhone by remember { mutableStateOf("+91 ") }
     var joinCode by remember { mutableStateOf("") }
@@ -637,6 +676,12 @@ fun FamilySafeApp() {
             TopAppBar(
                 title = { Text("FamilySafe") },
                 actions = {
+                    IconButton(onClick = onToggleDark) {
+                        Icon(
+                            if (dark) Icons.Default.LightMode else Icons.Default.DarkMode,
+                            contentDescription = if (dark) "Switch to light mode" else "Switch to dark mode"
+                        )
+                    }
                     IconButton(onClick = { showPrivacy = true }) {
                         Icon(Icons.Default.Lock, contentDescription = "Privacy")
                     }
@@ -692,6 +737,7 @@ fun FamilySafeApp() {
                                     onClick = {
                                         val fid = familyId
                                         if (fid != null) resolveSos(fid, alert.id)
+                                        LocationShareService.clearMySos(context)
                                     }
                                 ) { Text("I'm safe - cancel SOS") }
                             }
@@ -852,14 +898,72 @@ fun FamilySafeApp() {
                         Text("Emergency", style = MaterialTheme.typography.titleMedium)
                         Text("SOS sends an alert and your current location to everyone in your family. Family members whose sharing is ON get a phone notification, even when the app is closed.")
                         Spacer(Modifier.height(10.dp))
-                        OutlinedButton(
+                        Button(
                             enabled = uid != null && familyId != null,
-                            onClick = { showSosConfirm = true }
+                            onClick = { showSosConfirm = true },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SosRed,
+                                contentColor = Color.White
+                            ),
+                            modifier = Modifier.fillMaxWidth()
                         ) {
                             Icon(Icons.Default.Warning, contentDescription = null)
                             Spacer(Modifier.width(8.dp))
-                            Text("SOS")
+                            Text("SOS", fontWeight = FontWeight.Bold)
                         }
+
+                        Spacer(Modifier.height(14.dp))
+                        HorizontalDivider()
+                        Spacer(Modifier.height(10.dp))
+
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(
+                                checked = powerSos,
+                                onCheckedChange = { on ->
+                                    if (on) {
+                                        rulesTurnOn = true
+                                        showSosRules = true
+                                    } else {
+                                        powerSos = false
+                                        p.edit().putBoolean(KEY_POWER_SOS, false).apply()
+                                    }
+                                }
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text("Power button SOS", style = MaterialTheme.typography.titleSmall)
+                        }
+                        Text("Press the power button $sosPresses times quickly to send SOS, even with the screen off or the app closed.")
+                        Spacer(Modifier.height(8.dp))
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            listOf(3, 4).forEach { n ->
+                                FilterChip(
+                                    selected = sosPresses == n,
+                                    onClick = {
+                                        sosPresses = n
+                                        p.edit().putInt(KEY_SOS_PRESSES, n).apply()
+                                    },
+                                    label = { Text("$n presses") }
+                                )
+                            }
+                        }
+                        Text(
+                            if (sosPresses == 3)
+                                "If 3 presses opens the camera or another feature on your phone, choose 4 presses."
+                            else
+                                "Press exactly 4 times. Pressing 5 times can start the phone's own Emergency SOS, which calls 112.",
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        if (powerSos && !sharing) {
+                            Spacer(Modifier.height(6.dp))
+                            Text(
+                                "Turn on Location sharing above. Power button SOS only works while sharing is ON.",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        TextButton(onClick = {
+                            rulesTurnOn = false
+                            showSosRules = true
+                        }) { Text("SOS rules") }
                         if (familyId == null) {
                             Spacer(Modifier.height(6.dp))
                             Text("Join or create a family first.")
@@ -977,6 +1081,50 @@ fun FamilySafeApp() {
             },
             dismissButton = {
                 TextButton(onClick = { sosShareText = null }) { Text("Done") }
+            }
+        )
+    }
+
+    if (showSosRules) {
+        AlertDialog(
+            onDismissRequest = { showSosRules = false },
+            title = { Text("Power button SOS - rules") },
+            text = {
+                LazyColumn {
+                    item {
+                        Text(
+                            "How it works\n" +
+                                "1. Press the power button $sosPresses times quickly, less than 1.5 seconds between presses. It works with the screen off and the app closed.\n" +
+                                "2. Your phone vibrates and a notification counts down 5 seconds. Tap Cancel in it if it was a mistake.\n" +
+                                "3. After 5 seconds an SOS with your location goes to everyone in your family. Tap \"I'm safe - cancel SOS\" in the notification or the app to end it.\n\n" +
+                                "Rules\n" +
+                                "- It works only while Location sharing is ON (the \"sharing your location\" notification is showing).\n" +
+                                "- After a phone restart, open FamilySafe once.\n" +
+                                "- If 3 presses opens the camera, Google Assistant or another feature on your phone, switch to 4 presses.\n" +
+                                "- FamilySafe never calls 112. But on many phones (Android 12+, Samsung) pressing the power button 5 times starts the phone's own Emergency SOS, which does call 112. Never press more times than needed.\n" +
+                                "- During testing, turn off the phone's own Emergency SOS: Settings > Safety & emergency > Emergency SOS (on Samsung: Settings > Safety and emergency > Emergency SOS / Send SOS messages).\n" +
+                                "- Phones in a pocket or bag can press the button by mistake. Feel for the vibration and cancel if needed.\n" +
+                                "- Try it once with your family so everyone knows what the alert looks like."
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showSosRules = false
+                    if (rulesTurnOn) {
+                        powerSos = true
+                        p.edit().putBoolean(KEY_POWER_SOS, true).apply()
+                        if (!sharing) {
+                            toast(context, "Now turn on Location sharing so power button SOS can work.")
+                        }
+                    }
+                }) { Text(if (rulesTurnOn) "I understand, turn on" else "OK") }
+            },
+            dismissButton = {
+                if (rulesTurnOn) {
+                    TextButton(onClick = { showSosRules = false }) { Text("Cancel") }
+                }
             }
         )
     }

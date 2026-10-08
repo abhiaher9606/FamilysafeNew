@@ -16,6 +16,10 @@ internal const val KEY_FAMILY = "family_id"
 internal const val KEY_SHARING = "sharing"
 internal const val KEY_SEEN_SOS = "seen_sos"
 internal const val KEY_BG_HELP_SHOWN = "bg_help_shown"
+internal const val KEY_DARK_MODE = "dark_mode"
+internal const val KEY_POWER_SOS = "power_sos_enabled"
+internal const val KEY_SOS_PRESSES = "power_sos_presses"
+internal const val KEY_POWER_SOS_ID = "power_sos_active_id"
 
 internal val db: FirebaseFirestore
     get() = FirebaseFirestore.getInstance()

@@ -6,13 +6,22 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.core.content.ContextCompat
+import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationCallback
 import com.google.android.gms.location.LocationRequest
@@ -33,9 +42,18 @@ class LocationShareService : Service() {
     companion object {
         const val ACTION_START = "com.familysafe.app.START"
         const val ACTION_STOP = "com.familysafe.app.STOP"
+        const val ACTION_CANCEL_COUNTDOWN = "com.familysafe.app.CANCEL_COUNTDOWN"
+        const val ACTION_IM_SAFE = "com.familysafe.app.IM_SAFE"
         private const val CHANNEL_SHARING = "sharing"
         private const val CHANNEL_SOS = "sos"
+        private const val CHANNEL_MY_SOS = "my_sos"
         private const val NOTIF_SHARING_ID = 1001
+        private const val NOTIF_MY_SOS_ID = 1002
+
+        /** Longest allowed gap between two power-button presses. */
+        private const val MAX_GAP_MS = 1500L
+        /** Time the user has to cancel an accidental power-button SOS. */
+        private const val COUNTDOWN_MS = 5000L
 
         fun start(context: Context) {
             val intent = Intent(context, LocationShareService::class.java)
@@ -46,11 +64,25 @@ class LocationShareService : Service() {
         fun stop(context: Context) {
             context.stopService(Intent(context, LocationShareService::class.java))
         }
+
+        /** Called when the user cancels their SOS from inside the app. */
+        fun clearMySos(context: Context) {
+            context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit().remove(KEY_POWER_SOS_ID).apply()
+            context.getSystemService(NotificationManager::class.java).cancel(NOTIF_MY_SOS_ID)
+        }
     }
 
     private var client: FusedLocationProviderClient? = null
     private var callback: LocationCallback? = null
     private var sosListener: ListenerRegistration? = null
+
+    // power-button SOS
+    private var screenReceiver: BroadcastReceiver? = null
+    private val pressTimes = ArrayList<Long>()
+    private val handler = Handler(Looper.getMainLooper())
+    private var countdownRunning = false
+    private val sendRunnable = Runnable { sendPowerButtonSos() }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -60,6 +92,14 @@ class LocationShareService : Service() {
         if (intent?.action == ACTION_STOP) {
             stopFromNotification()
             return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_COUNTDOWN) {
+            cancelCountdown()
+            return if (client != null) START_STICKY else stopIfIdle()
+        }
+        if (intent?.action == ACTION_IM_SAFE) {
+            markSafe()
+            return if (client != null) START_STICKY else stopIfIdle()
         }
 
         try {
@@ -82,6 +122,7 @@ class LocationShareService : Service() {
 
         if (client == null) startLocationUpdates(fid, me)
         if (sosListener == null) listenForSos(fid, me)
+        if (screenReceiver == null) listenForPowerButton()
         return START_STICKY
     }
 
@@ -93,6 +134,10 @@ class LocationShareService : Service() {
         callback = null
         sosListener?.remove()
         sosListener = null
+        screenReceiver?.let { unregisterReceiver(it) }
+        screenReceiver = null
+        handler.removeCallbacks(sendRunnable)
+        countdownRunning = false
         super.onDestroy()
     }
 
@@ -201,6 +246,217 @@ class LocationShareService : Service() {
             .notify(sosId.hashCode(), notification)
     }
 
+    // ---- power-button SOS ----
+    // Android does not let apps read the power button directly. Each press
+    // turns the screen off or on, so we count quick screen off/on changes.
+
+    private fun listenForPowerButton() {
+        val r = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                onPowerPress()
+            }
+        }
+        val filter = IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_OFF)
+            addAction(Intent.ACTION_SCREEN_ON)
+        }
+        ContextCompat.registerReceiver(this, r, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
+        screenReceiver = r
+    }
+
+    private fun onPowerPress() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(KEY_POWER_SOS, false)) {
+            pressTimes.clear()
+            return
+        }
+        if (countdownRunning) return
+
+        val now = SystemClock.elapsedRealtime()
+        if (pressTimes.isNotEmpty() && now - pressTimes.last() > MAX_GAP_MS) {
+            pressTimes.clear()
+        }
+        pressTimes.add(now)
+
+        // Trial phase: only 3 or 4 presses. 5 presses would also start the
+        // phone's own Emergency SOS, which calls 112.
+        val needed = prefs.getInt(KEY_SOS_PRESSES, 3).coerceIn(3, 4)
+        if (pressTimes.size >= needed) {
+            pressTimes.clear()
+            startCountdown()
+        }
+    }
+
+    private fun startCountdown() {
+        countdownRunning = true
+        vibrate(longArrayOf(0, 400, 150, 400, 150, 400))
+
+        val cancel = PendingIntent.getService(
+            this,
+            2,
+            Intent(this, LocationShareService::class.java).setAction(ACTION_CANCEL_COUNTDOWN),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val notification = Notification.Builder(this, CHANNEL_MY_SOS)
+            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+            .setContentTitle("SOS will be sent in 5 seconds")
+            .setContentText("Power button pressed. Tap Cancel if this was a mistake.")
+            .setCategory(Notification.CATEGORY_ALARM)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setWhen(System.currentTimeMillis() + COUNTDOWN_MS)
+            .setShowWhen(true)
+            .setUsesChronometer(true)
+            .setChronometerCountDown(true)
+            .setOngoing(true)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Cancel", cancel)
+            .build()
+        notifyMySos(notification)
+
+        handler.postDelayed(sendRunnable, COUNTDOWN_MS)
+    }
+
+    private fun cancelCountdown() {
+        handler.removeCallbacks(sendRunnable)
+        countdownRunning = false
+        pressTimes.clear()
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_MY_SOS_ID)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun sendPowerButtonSos() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val fid = prefs.getString(KEY_FAMILY, null)
+        val me = FirebaseAuth.getInstance().currentUser?.uid
+        val name = prefs.getString(KEY_NAME, null)?.takeIf { it.isNotBlank() } ?: "A family member"
+        if (fid == null || me == null) {
+            countdownRunning = false
+            return
+        }
+
+        notifyMySos(
+            Notification.Builder(this, CHANNEL_MY_SOS)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle("Sending SOS...")
+                .setContentText("Getting your location")
+                .setOngoing(true)
+                .build()
+        )
+
+        fun send(lat: Double?, lng: Double?) {
+            sendSos(fid, me, name, lat, lng) { sosId, error ->
+                countdownRunning = false
+                if (sosId != null) {
+                    prefs.edit().putString(KEY_POWER_SOS_ID, sosId).apply()
+                    vibrate(longArrayOf(0, 800))
+                    showSosSentNotification(lat != null)
+                } else {
+                    notifyMySos(
+                        Notification.Builder(this, CHANNEL_MY_SOS)
+                            .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                            .setContentTitle("SOS could not be sent")
+                            .setContentText(error ?: "Check your internet and try again from the app.")
+                            .setContentIntent(openAppIntent())
+                            .setAutoCancel(true)
+                            .build()
+                    )
+                }
+            }
+        }
+
+        if (!hasLocationPermission(this)) {
+            send(null, null)
+            return
+        }
+        try {
+            val c = LocationServices.getFusedLocationProviderClient(this)
+            c.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, CancellationTokenSource().token)
+                .addOnSuccessListener { loc ->
+                    if (loc != null) {
+                        send(loc.latitude, loc.longitude)
+                    } else {
+                        c.lastLocation
+                            .addOnSuccessListener { last -> send(last?.latitude, last?.longitude) }
+                            .addOnFailureListener { send(null, null) }
+                    }
+                }
+                .addOnFailureListener {
+                    c.lastLocation
+                        .addOnSuccessListener { last -> send(last?.latitude, last?.longitude) }
+                        .addOnFailureListener { send(null, null) }
+                }
+        } catch (e: SecurityException) {
+            send(null, null)
+        }
+    }
+
+    private fun showSosSentNotification(withLocation: Boolean) {
+        val safe = PendingIntent.getService(
+            this,
+            3,
+            Intent(this, LocationShareService::class.java).setAction(ACTION_IM_SAFE),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val text = if (withLocation) {
+            "Your family was alerted with your location."
+        } else {
+            "Your family was alerted. Your location could not be found."
+        }
+        notifyMySos(
+            Notification.Builder(this, CHANNEL_MY_SOS)
+                .setSmallIcon(android.R.drawable.ic_dialog_alert)
+                .setContentTitle("SOS sent")
+                .setContentText(text)
+                .setVisibility(Notification.VISIBILITY_PUBLIC)
+                .setContentIntent(openAppIntent())
+                .setOngoing(true)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "I'm safe - cancel SOS", safe)
+                .build()
+        )
+    }
+
+    private fun markSafe() {
+        val prefs = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+        val fid = prefs.getString(KEY_FAMILY, null)
+        val sosId = prefs.getString(KEY_POWER_SOS_ID, null)
+        if (fid != null && sosId != null) resolveSos(fid, sosId)
+        prefs.edit().remove(KEY_POWER_SOS_ID).apply()
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_MY_SOS_ID)
+    }
+
+    private fun stopIfIdle(): Int {
+        if (client == null) stopSelf()
+        return START_NOT_STICKY
+    }
+
+    private fun openAppIntent(): PendingIntent = PendingIntent.getActivity(
+        this,
+        0,
+        Intent(this, MainActivity::class.java),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    private fun notifyMySos(notification: Notification) {
+        try {
+            getSystemService(NotificationManager::class.java).notify(NOTIF_MY_SOS_ID, notification)
+        } catch (e: SecurityException) {
+            // notifications not allowed; the SOS itself still goes out
+        }
+    }
+
+    private fun vibrate(pattern: LongArray) {
+        try {
+            val v: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                getSystemService(VibratorManager::class.java).defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                getSystemService(Vibrator::class.java)
+            }
+            v.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } catch (e: Exception) {
+            // no vibrator
+        }
+    }
+
     // ---- notification plumbing ----
 
     private fun createChannels() {
@@ -222,6 +478,16 @@ class LocationShareService : Service() {
         sos.description = "Emergency alerts from your family"
         sos.enableVibration(true)
         nm.createNotificationChannel(sos)
+
+        val mySos = NotificationChannel(
+            CHANNEL_MY_SOS,
+            "My SOS (power button)",
+            NotificationManager.IMPORTANCE_HIGH
+        )
+        mySos.description = "Countdown and status when you send an SOS with the power button"
+        mySos.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        mySos.enableVibration(true)
+        nm.createNotificationChannel(mySos)
     }
 
     private fun enterForeground() {
