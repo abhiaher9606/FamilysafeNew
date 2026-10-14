@@ -122,6 +122,7 @@ class LocationShareService : Service() {
 
         if (client == null) startLocationUpdates(fid, me)
         if (sosListener == null) listenForSos(fid, me)
+        cleanupOldTrail(fid, me)
         if (screenReceiver == null) listenForPowerButton()
         return START_STICKY
     }
@@ -155,6 +156,7 @@ class LocationShareService : Service() {
             override fun onLocationResult(result: LocationResult) {
                 val loc = result.lastLocation ?: return
                 writeLocation(fid, me, loc.latitude, loc.longitude)
+                writeTrailPoint(fid, me, loc.latitude, loc.longitude)
             }
         }
 
@@ -390,12 +392,20 @@ class LocationShareService : Service() {
     }
 
     private fun showSosSentNotification(withLocation: Boolean) {
-        val safe = PendingIntent.getService(
-            this,
-            3,
-            Intent(this, LocationShareService::class.java).setAction(ACTION_IM_SAFE),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val locked = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_LOCK_ENABLED, false) &&
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_PIN_HASH, null) != null
+        val safe = if (locked) {
+            openAppIntent()
+        } else {
+            PendingIntent.getService(
+                this,
+                3,
+                Intent(this, LocationShareService::class.java).setAction(ACTION_IM_SAFE),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
+        val safeLabel = if (locked) "I'm safe (unlock in app)" else "I'm safe - cancel SOS"
         val text = if (withLocation) {
             "Your family was alerted with your location."
         } else {
@@ -409,7 +419,7 @@ class LocationShareService : Service() {
                 .setVisibility(Notification.VISIBILITY_PUBLIC)
                 .setContentIntent(openAppIntent())
                 .setOngoing(true)
-                .addAction(android.R.drawable.ic_menu_close_clear_cancel, "I'm safe - cancel SOS", safe)
+                .addAction(android.R.drawable.ic_menu_close_clear_cancel, safeLabel, safe)
                 .build()
         )
     }
@@ -497,12 +507,23 @@ class LocationShareService : Service() {
             Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
-        val stopAction = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, LocationShareService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
+        val locked = getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+            .getBoolean(KEY_LOCK_ENABLED, false) &&
+            getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString(KEY_PIN_HASH, null) != null
+
+        // When the lock is on, "Stop sharing" opens the app (which asks for the
+        // PIN/fingerprint) instead of stopping directly from the notification.
+        val stopAction = if (locked) {
+            openApp
+        } else {
+            PendingIntent.getService(
+                this,
+                1,
+                Intent(this, LocationShareService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+            )
+        }
+        val stopLabel = if (locked) "Stop sharing (unlock in app)" else "Stop sharing"
 
         val notification = Notification.Builder(this, CHANNEL_SHARING)
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
@@ -510,7 +531,7 @@ class LocationShareService : Service() {
             .setContentText("Your family can see where you are. Tap to open the app.")
             .setContentIntent(openApp)
             .setOngoing(true)
-            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop sharing", stopAction)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, stopLabel, stopAction)
             .build()
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {

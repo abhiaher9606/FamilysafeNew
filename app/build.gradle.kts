@@ -13,8 +13,8 @@ android {
         applicationId = "com.familysafe.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 4
-        versionName = "1.3"
+        versionCode = 6
+        versionName = "1.5"
     }
 
     compileOptions {
@@ -43,4 +43,11 @@ dependencies {
     implementation("com.google.firebase:firebase-auth")
     implementation("com.google.firebase:firebase-firestore")
     implementation("com.google.android.gms:play-services-location:21.3.0")
+
+    // In-app map for location history
+    implementation("com.google.android.gms:play-services-maps:19.0.0")
+    implementation("com.google.maps.android:maps-compose:6.2.1")
+
+    // Fingerprint / PIN unlock for the security lock
+    implementation("androidx.biometric:biometric:1.1.0")
 }

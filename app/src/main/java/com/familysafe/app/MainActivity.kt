@@ -12,6 +12,10 @@ import android.os.Bundle
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.isSystemInDarkTheme
@@ -72,6 +76,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.LifecycleEventEffect
@@ -333,7 +338,7 @@ private fun joinWithCode(
 // Activity + UI
 // ---------------------------------------------------------------
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
@@ -363,6 +368,42 @@ class MainActivity : ComponentActivity() {
                 )
             }
         }
+    }
+}
+
+/** Shows the fingerprint prompt. Falls back to PIN on any error or "Use PIN". */
+private fun showBiometricUnlock(
+    activity: FragmentActivity,
+    onSuccess: () -> Unit,
+    onUsePin: () -> Unit
+) {
+    val manager = BiometricManager.from(activity)
+    val can = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_WEAK)
+    if (can != BiometricManager.BIOMETRIC_SUCCESS) {
+        onUsePin()
+        return
+    }
+    val prompt = BiometricPrompt(
+        activity,
+        ContextCompat.getMainExecutor(activity),
+        object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                onSuccess()
+            }
+            override fun onAuthenticationError(code: Int, msg: CharSequence) {
+                onUsePin()
+            }
+        }
+    )
+    val info = BiometricPrompt.PromptInfo.Builder()
+        .setTitle("Unlock FamilySafe")
+        .setSubtitle("Confirm it's you to continue")
+        .setNegativeButtonText("Use PIN")
+        .build()
+    try {
+        prompt.authenticate(info)
+    } catch (e: Exception) {
+        onUsePin()
     }
 }
 
@@ -397,6 +438,11 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
     var sosPresses by remember { mutableStateOf(p.getInt(KEY_SOS_PRESSES, 3).coerceIn(3, 4)) }
     var showSosRules by remember { mutableStateOf(false) }
     var rulesTurnOn by remember { mutableStateOf(false) }
+    var lockOn by remember { mutableStateOf(lockEnabled(context)) }
+    var bioOn by remember { mutableStateOf(p.getBoolean(KEY_BIOMETRIC, false)) }
+    var showSetPin by remember { mutableStateOf(false) }
+    var pendingAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var showPinUnlock by remember { mutableStateOf(false) }
     var inviteName by remember { mutableStateOf("") }
     var invitePhone by remember { mutableStateOf("+91 ") }
     var joinCode by remember { mutableStateOf("") }
@@ -526,6 +572,30 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
     }
 
     // ---- actions ----
+    val activity = context as? FragmentActivity
+
+    // Runs [action] immediately if the lock is off; otherwise asks for
+    // fingerprint (if enabled) or the PIN first.
+    fun requireUnlock(action: () -> Unit) {
+        if (!lockEnabled(context)) {
+            action()
+            return
+        }
+        if (bioOn && activity != null) {
+            showBiometricUnlock(
+                activity,
+                onSuccess = { action() },
+                onUsePin = {
+                    pendingAction = action
+                    showPinUnlock = true
+                }
+            )
+        } else {
+            pendingAction = action
+            showPinUnlock = true
+        }
+    }
+
     fun beginSharing() {
         val me = uid
         val fid = familyId
@@ -735,9 +805,11 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
                             if (mine) {
                                 OutlinedButton(
                                     onClick = {
-                                        val fid = familyId
-                                        if (fid != null) resolveSos(fid, alert.id)
-                                        LocationShareService.clearMySos(context)
+                                        requireUnlock {
+                                            val fid = familyId
+                                            if (fid != null) resolveSos(fid, alert.id)
+                                            LocationShareService.clearMySos(context)
+                                        }
                                     }
                                 ) { Text("I'm safe - cancel SOS") }
                             }
@@ -768,7 +840,7 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
                                             permissionLauncher.launch(sharingPermissions())
                                         }
                                     } else {
-                                        stopSharing()
+                                        requireUnlock { stopSharing() }
                                     }
                                 }
                             )
@@ -856,10 +928,25 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
                         )
                     },
                     trailingContent = {
-                        if (hasLocation) {
-                            TextButton(
-                                onClick = { openMap(context, m.name, m.lat!!, m.lng!!) }
-                            ) { Text("Map") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                            val fid = familyId
+                            if (fid != null) {
+                                TextButton(
+                                    onClick = {
+                                        context.startActivity(
+                                            Intent(context, HistoryActivity::class.java)
+                                                .putExtra(HistoryActivity.EXTRA_FAMILY, fid)
+                                                .putExtra(HistoryActivity.EXTRA_UID, m.uid)
+                                                .putExtra(HistoryActivity.EXTRA_NAME, m.name)
+                                        )
+                                    }
+                                ) { Text("History") }
+                            }
+                            if (hasLocation) {
+                                TextButton(
+                                    onClick = { openMap(context, m.name, m.lat!!, m.lng!!) }
+                                ) { Text("Map") }
+                            }
                         }
                     }
                 )
@@ -883,6 +970,62 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
                 item {
                     TextButton(onClick = { showLeave = true }) {
                         Text("Leave this family")
+                    }
+                }
+            }
+
+            item {
+                Card(modifier = Modifier.fillMaxWidth()) {
+                    Column(Modifier.padding(18.dp)) {
+                        Text("Security lock", style = MaterialTheme.typography.titleMedium)
+                        Text("When on, only you can turn off location sharing, cancel an active SOS, or leave the family - a PIN or fingerprint is required. This stops anyone else from quickly switching it off.")
+                        Spacer(Modifier.height(10.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(
+                                checked = lockOn,
+                                onCheckedChange = { on ->
+                                    if (on) {
+                                        showSetPin = true
+                                    } else {
+                                        requireUnlock {
+                                            clearLock(context)
+                                            lockOn = false
+                                            bioOn = false
+                                        }
+                                    }
+                                }
+                            )
+                            Spacer(Modifier.width(10.dp))
+                            Text(if (lockOn) "Lock ON" else "Lock OFF")
+                        }
+                        if (lockOn) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Switch(
+                                    checked = bioOn,
+                                    onCheckedChange = { on ->
+                                        if (on) {
+                                            val can = BiometricManager.from(context).canAuthenticate(
+                                                BiometricManager.Authenticators.BIOMETRIC_WEAK
+                                            )
+                                            if (can == BiometricManager.BIOMETRIC_SUCCESS) {
+                                                bioOn = true
+                                                p.edit().putBoolean(KEY_BIOMETRIC, true).apply()
+                                            } else {
+                                                toast(context, "No fingerprint is set up on this phone. Add one in Settings first.")
+                                            }
+                                        } else {
+                                            bioOn = false
+                                            p.edit().putBoolean(KEY_BIOMETRIC, false).apply()
+                                        }
+                                    }
+                                )
+                                Spacer(Modifier.width(10.dp))
+                                Text("Also allow fingerprint")
+                            }
+                            TextButton(onClick = { requireUnlock { showSetPin = true } }) {
+                                Text("Change PIN")
+                            }
+                        }
                     }
                 }
             }
@@ -1085,6 +1228,108 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
         )
     }
 
+    if (showSetPin) {
+        var newPin by remember { mutableStateOf("") }
+        var confirmPin by remember { mutableStateOf("") }
+        AlertDialog(
+            onDismissRequest = { showSetPin = false },
+            title = { Text(if (lockOn) "Change PIN" else "Set a PIN") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    Text("Choose a 4 to 6 digit PIN. You'll need it to turn off sharing, cancel an SOS, or leave the family. If you forget it, reinstalling the app clears it.")
+                    OutlinedTextField(
+                        value = newPin,
+                        onValueChange = { newPin = it.filter { c -> c.isDigit() }.take(6) },
+                        label = { Text("New PIN") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    OutlinedTextField(
+                        value = confirmPin,
+                        onValueChange = { confirmPin = it.filter { c -> c.isDigit() }.take(6) },
+                        label = { Text("Confirm PIN") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (confirmPin.isNotEmpty() && newPin != confirmPin) {
+                        Text("PINs do not match", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = newPin.length in 4..6 && newPin == confirmPin,
+                    onClick = {
+                        setPin(context, newPin)
+                        p.edit().putBoolean(KEY_LOCK_ENABLED, true).apply()
+                        lockOn = true
+                        showSetPin = false
+                        toast(context, "Security lock is on")
+                    }
+                ) { Text("Save") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showSetPin = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    if (showPinUnlock) {
+        var unlockPin by remember { mutableStateOf("") }
+        var wrong by remember { mutableStateOf(false) }
+        AlertDialog(
+            onDismissRequest = {
+                showPinUnlock = false
+                pendingAction = null
+            },
+            title = { Text("Enter PIN") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = unlockPin,
+                        onValueChange = {
+                            unlockPin = it.filter { c -> c.isDigit() }.take(6)
+                            wrong = false
+                        },
+                        label = { Text("PIN") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (wrong) {
+                        Text("Wrong PIN", color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    enabled = unlockPin.length in 4..6,
+                    onClick = {
+                        if (checkPin(context, unlockPin)) {
+                            val act = pendingAction
+                            pendingAction = null
+                            showPinUnlock = false
+                            act?.invoke()
+                        } else {
+                            wrong = true
+                        }
+                    }
+                ) { Text("Unlock") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showPinUnlock = false
+                    pendingAction = null
+                }) { Text("Cancel") }
+            }
+        )
+    }
+
     if (showSosRules) {
         AlertDialog(
             onDismissRequest = { showSosRules = false },
@@ -1215,7 +1460,7 @@ fun FamilySafeApp(dark: Boolean, onToggleDark: () -> Unit) {
             confirmButton = {
                 TextButton(onClick = {
                     showLeave = false
-                    leaveFamily()
+                    requireUnlock { leaveFamily() }
                 }) { Text("Leave") }
             },
             dismissButton = {
