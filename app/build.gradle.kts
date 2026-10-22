@@ -13,8 +13,28 @@ android {
         applicationId = "com.familysafe.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "1.5"
+        versionCode = 7
+        versionName = "1.6"
+    }
+
+    val keystoreFile = System.getenv("KEYSTORE_FILE")
+    signingConfigs {
+        create("release") {
+            if (keystoreFile != null) {
+                storeFile = file(keystoreFile)
+                storePassword = System.getenv("KEYSTORE_PASSWORD")
+                keyAlias = System.getenv("KEY_ALIAS")
+                keyPassword = System.getenv("KEY_PASSWORD")
+            }
+        }
+    }
+
+    buildTypes {
+        getByName("debug") {
+            if (keystoreFile != null) {
+                signingConfig = signingConfigs.getByName("release")
+            }
+        }
     }
 
     compileOptions {
@@ -44,10 +64,8 @@ dependencies {
     implementation("com.google.firebase:firebase-firestore")
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
-    // In-app map for location history
     implementation("com.google.android.gms:play-services-maps:19.0.0")
     implementation("com.google.maps.android:maps-compose:6.2.1")
 
-    // Fingerprint / PIN unlock for the security lock
     implementation("androidx.biometric:biometric:1.1.0")
 }
