@@ -10,12 +10,9 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.width
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.ChevronLeft
@@ -29,6 +26,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -37,19 +35,18 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.google.android.gms.maps.CameraUpdateFactory
-import com.google.android.gms.maps.model.CameraPosition
-import com.google.android.gms.maps.model.LatLng
-import com.google.android.gms.maps.model.LatLngBounds
-import com.google.maps.android.compose.GoogleMap
-import com.google.maps.android.compose.MapProperties
-import com.google.maps.android.compose.MapType
-import com.google.maps.android.compose.Marker
-import com.google.maps.android.compose.MarkerState
-import com.google.maps.android.compose.Polyline
-import com.google.maps.android.compose.rememberCameraPositionState
+import androidx.compose.ui.viewinterop.AndroidView
+import org.osmdroid.config.Configuration
+import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+import org.osmdroid.util.BoundingBox
+import org.osmdroid.util.GeoPoint
+import org.osmdroid.views.MapView
+import org.osmdroid.views.overlay.Marker
+import org.osmdroid.views.overlay.Polyline
+import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Calendar
 import java.util.Date
@@ -57,8 +54,8 @@ import java.util.Locale
 
 /**
  * Shows one family member's stored location trail for a chosen day:
- * the route drawn as a line on a map, with start/end markers and a summary.
- * You can step back up to HISTORY_DAYS days.
+ * the route drawn as a line on a free OpenStreetMap map (no API key, no
+ * billing), with start/end markers and a summary. Steps back HISTORY_DAYS days.
  */
 class HistoryActivity : ComponentActivity() {
 
@@ -71,6 +68,13 @@ class HistoryActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+
+        // osmdroid setup: identify the app and keep the tile cache in the app's
+        // own internal storage, so no storage permission is needed.
+        val cfg = Configuration.getInstance()
+        cfg.userAgentValue = packageName
+        cfg.osmdroidBasePath = File(cacheDir, "osmdroid")
+        cfg.osmdroidTileCache = File(cacheDir, "osmdroid/tiles")
 
         val familyId = intent.getStringExtra(EXTRA_FAMILY)
         val uid = intent.getStringExtra(EXTRA_UID)
@@ -102,7 +106,6 @@ class HistoryActivity : ComponentActivity() {
 
 private data class TrailPoint(val lat: Double, val lng: Double, val t: Long)
 
-/** Start of local day, `daysAgo` days before today. */
 private fun dayStartMillis(daysAgo: Int): Long {
     val c = Calendar.getInstance()
     c.add(Calendar.DAY_OF_YEAR, -daysAgo)
@@ -119,7 +122,6 @@ private fun formatDay(startMs: Long): String =
 private fun formatTime(ms: Long): String =
     SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(ms))
 
-/** Total distance of the trail in metres. */
 private fun totalDistance(points: List<TrailPoint>): Double {
     var sum = 0.0
     val out = FloatArray(1)
@@ -142,7 +144,6 @@ private fun HistoryScreen(
     name: String,
     onBack: () -> Unit
 ) {
-    // 0 = today, 1 = yesterday, ... up to HISTORY_DAYS - 1
     var daysAgo by remember { mutableIntStateOf(0) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -190,7 +191,6 @@ private fun HistoryScreen(
                 .fillMaxSize()
                 .padding(pad)
         ) {
-            // day selector
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -224,7 +224,6 @@ private fun HistoryScreen(
                 }
             }
 
-            // summary line
             if (!loading && error == null) {
                 val summary = if (list.isEmpty()) {
                     "No location recorded this day."
@@ -242,8 +241,8 @@ private fun HistoryScreen(
             }
 
             Box(modifier = Modifier.fillMaxSize()) {
-                if (error == null) {
-                    TrailMap(points = list, dark = false)
+                if (error == null && list.isNotEmpty()) {
+                    TrailMap(points = list, modifier = Modifier.fillMaxSize())
                 }
                 when {
                     loading -> Box(
@@ -272,43 +271,71 @@ private fun HistoryScreen(
 }
 
 @Composable
-private fun TrailMap(points: List<TrailPoint>, dark: Boolean) {
-    val latLngs = remember(points) { points.map { LatLng(it.lat, it.lng) } }
-    val cameraPositionState = rememberCameraPositionState {
-        position = CameraPosition.fromLatLngZoom(
-            latLngs.lastOrNull() ?: LatLng(20.5937, 78.9629), // India fallback
-            if (latLngs.isEmpty()) 4f else 14f
-        )
+private fun TrailMap(points: List<TrailPoint>, modifier: Modifier) {
+    val context = LocalContext.current
+    val mapView = remember {
+        MapView(context).apply {
+            setTileSource(TileSourceFactory.MAPNIK)
+            setMultiTouchControls(true)
+            setUseDataConnection(true)
+        }
     }
 
-    // fit all points into view once they load
-    LaunchedEffect(latLngs) {
-        if (latLngs.size >= 2) {
-            val b = LatLngBounds.builder()
-            latLngs.forEach { b.include(it) }
-            try {
-                cameraPositionState.move(CameraUpdateFactory.newLatLngBounds(b.build(), 120))
-            } catch (e: Exception) {
-                cameraPositionState.move(CameraUpdateFactory.newLatLngZoom(latLngs.last(), 14f))
+    DisposableEffect(Unit) {
+        mapView.onResume()
+        onDispose { mapView.onPause() }
+    }
+
+    AndroidView(
+        factory = { mapView },
+        modifier = modifier,
+        update = { map ->
+            map.overlays.clear()
+            val geoPoints = points.map { GeoPoint(it.lat, it.lng) }
+            if (geoPoints.size >= 2) {
+                val line = Polyline(map).apply {
+                    setPoints(geoPoints)
+                    outlinePaint.strokeWidth = 10f
+                    outlinePaint.color = android.graphics.Color.parseColor("#1565C0")
+                }
+                map.overlays.add(line)
+                map.overlays.add(
+                    Marker(map).apply {
+                        position = geoPoints.first()
+                        title = "Start"
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    }
+                )
+                map.overlays.add(
+                    Marker(map).apply {
+                        position = geoPoints.last()
+                        title = "Latest"
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    }
+                )
+                val bbox = BoundingBox.fromGeoPointsSafe(geoPoints)
+                map.post {
+                    try {
+                        map.zoomToBoundingBox(bbox, false, 80)
+                    } catch (e: Exception) {
+                        map.controller.setZoom(14.0)
+                        map.controller.setCenter(geoPoints.last())
+                    }
+                }
+            } else if (geoPoints.size == 1) {
+                map.controller.setZoom(16.0)
+                map.controller.setCenter(geoPoints.first())
+                map.overlays.add(
+                    Marker(map).apply {
+                        position = geoPoints.first()
+                        title = "Location"
+                        setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                    }
+                )
             }
-        } else if (latLngs.size == 1) {
-            cameraPositionState.move(CameraUpdateFactory.newLatLngZoom(latLngs.first(), 15f))
+            map.invalidate()
         }
-    }
-
-    GoogleMap(
-        modifier = Modifier.fillMaxSize(),
-        cameraPositionState = cameraPositionState,
-        properties = MapProperties(mapType = MapType.NORMAL)
-    ) {
-        if (latLngs.size >= 2) {
-            Polyline(points = latLngs, width = 12f)
-            Marker(state = MarkerState(position = latLngs.first()), title = "Start")
-            Marker(state = MarkerState(position = latLngs.last()), title = "Latest")
-        } else if (latLngs.size == 1) {
-            Marker(state = MarkerState(position = latLngs.first()), title = "Location")
-        }
-    }
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
