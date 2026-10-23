@@ -1,9 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <!--
-        Paste your Google Maps Android API key between the tags below.
-        Get it from Google Cloud Console (see the chat for steps).
-        Keep this file private - do not share the repository publicly with a real key in it.
+        AIzaSyC1W-Y_YkMSivblEBTo3DR51mhLu4hi1Cw
     -->
     <string name="google_maps_key">AIzaSyDxmvlzRQZap9omc3YIu7JdlQE5uiFJo44</string>
 </resources>
