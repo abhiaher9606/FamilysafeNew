@@ -13,8 +13,8 @@ android {
         applicationId = "com.familysafe.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "1.6"
+        versionCode = 8
+        versionName = "1.7"
     }
 
     val keystoreFile = System.getenv("KEYSTORE_FILE")
@@ -64,8 +64,7 @@ dependencies {
     implementation("com.google.firebase:firebase-firestore")
     implementation("com.google.android.gms:play-services-location:21.3.0")
 
-    implementation("com.google.android.gms:play-services-maps:19.0.0")
-    implementation("com.google.maps.android:maps-compose:6.2.1")
+    implementation("org.osmdroid:osmdroid-android:6.1.20")
 
     implementation("androidx.biometric:biometric:1.1.0")
 }
